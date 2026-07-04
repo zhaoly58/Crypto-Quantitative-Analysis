@@ -30,7 +30,6 @@ def trend_status(price, ema20, ema50, ema200, is_weekly=False):
     short = "多头排列 (偏强)" if price > ema20 else "空头排列 (偏弱)"
     mid = "多头占优" if price > ema50 else "空头压制"
     
-    # 宏观与阶段性区分
     if is_weekly:
         long = "宏观牛市 (站稳周线牛熊分水岭)" if price > ema200 else "宏观熊市 (跌破周线牛熊分水岭)"
     else:
@@ -74,7 +73,6 @@ def rsi_status(rsi_value):
     else: return f"{rsi_value:.2f} (中性偏弱)"
 
 # --- 扩展数据接口模块 ---
-
 def get_live_funding_rate():
     try:
         exchange = ccxt.binance({'timeout': 3000})
@@ -108,11 +106,9 @@ def get_fear_and_greed():
     except Exception as e:
         return f"❌ 获取恐慌贪婪指数失败: {e}"
 
-
 def get_market_data():
     btc = yf.Ticker("BTC-USD")
     
-    # 日线历史底座
     df_daily = btc.history(period="1y", interval="1d")
     df_daily.index = df_daily.index.tz_localize(None)
     df_daily['EMA_20'] = EMAIndicator(close=df_daily['Close'], window=20).ema_indicator()
@@ -126,14 +122,12 @@ def get_market_data():
     df_daily['Volume_MA20'] = SMAIndicator(close=df_daily['Volume'], window=20).sma_indicator()
     df_daily.dropna(inplace=True)
     
-    # 50%单日振幅熔断保护
     pct_change = df_daily['Close'].pct_change().abs().iloc[-1]
     if pct_change > 0.50:
         raise Exception("检测到单日振幅>50%，Yahoo数据源可能遭遇插针污染，拒绝分析。")
 
     latest_d = df_daily.iloc[-1]
 
-    # 周线历史底座
     df_weekly = btc.history(period="5y", interval="1wk")
     df_weekly.index = df_weekly.index.tz_localize(None)
     df_weekly['EMA_20'] = EMAIndicator(close=df_weekly['Close'], window=20).ema_indicator()
@@ -144,7 +138,6 @@ def get_market_data():
     df_weekly.dropna(inplace=True)
     latest_w = df_weekly.iloc[-1]
 
-    # 从交易所获取精准实时一手的价格与时间戳（东京时区对齐）
     try:
         exchange = ccxt.binance({'timeout': 3000})
         ticker = exchange.fetch_ticker('BTC/USDT')
@@ -186,7 +179,36 @@ def get_market_data():
     }
     return context
 
-# --- 新增：纯 Python 毫秒级格式化函数 ---
+# --- 新增：纯 Python 量化规则引擎 (自动撰写推演) ---
+def generate_algo_prediction(context_dict):
+    trends = context_dict["Explicit_Trend_Labels"]
+    moms = context_dict["Explicit_Momentum_Labels"]
+    
+    # 1. 日线级别短线推演逻辑
+    short_pred = ""
+    if "多头排列 (偏强)" in trends['Daily_Trend']:
+        if "缩量" in moms['Volume_and_MACD']:
+            short_pred = "当前日线虽呈现偏强多头排列，但受制于成交量缩量，向上突破动能可能受限。短线或将在支撑与阻力位之间展开震荡修复，需警惕动能不足带来的冲高回落风险。"
+        else:
+            short_pred = "当前日线呈现偏强多头排列，且量能配合良好。若能继续保持 MACD 发散状态，短线有望继续向上测试上方阻力位，突破后多头空间将进一步打开。"
+    else:
+        if "极度贴近下轨" in moms['Bollinger_Position']:
+            short_pred = "日线整体处于空头压制状态，但价格极度贴近布林带下轨，存在较强的技术性超卖反弹预期。短线可能在核心支撑位附近企稳，并尝试向上修复布林带中轨。"
+        else:
+            short_pred = "当前日线处于偏弱空头排列，且动能指标未见明显企稳信号。空方压力较强，短线仍面临一定的下探风险，建议密切关注下方核心支撑位的防守情况。"
+
+    # 2. 周线级别长线推演逻辑
+    long_pred = ""
+    if "宏观熊市" in trends['Weekly_Trend']:
+        long_pred = "周线级别已跌破牛熊分水岭，宏观格局处于熊市压制之下。中长线空方压力依然显著，上方关键阻力集中在长周期均线附近。若无实质性放量反转信号，大周期或将持续承压。"
+    elif "宏观牛市" in trends['Weekly_Trend']:
+        long_pred = "周线级别稳站牛熊分水岭之上，宏观格局维持牛市趋势。大周期多头结构未被破坏，中长线仍以逢低做多为主，建议持续关注周线均线系统的支撑有效性。"
+    else:
+        long_pred = "周线级别长周期均线交织，宏观趋势处于震荡或方向确认期。中长线格局需等待关键阻力或支撑的有效突破，建议在大周期方向明朗前保持谨慎观望。"
+
+    return short_pred, long_pred
+
+# --- 完美统一结构的快照格式化 ---
 def format_fast_snapshot(context_dict):
     cp = context_dict["Current_Price"]
     dt = context_dict["Data_Timestamp_JST"]
@@ -195,27 +217,38 @@ def format_fast_snapshot(context_dict):
     moms = context_dict["Explicit_Momentum_Labels"]
     sr = context_dict["Explicit_Support_and_Resistance"]
     
-    html = f"⚡ <b>毫秒级极速快照 (纯数据无延迟)</b>\n\n"
+    # 调用规则引擎生成文字推演
+    short_pred, long_pred = generate_algo_prediction(context_dict)
+    
+    html = f"⚡ <b>毫秒级极速快照 (量化模型自动生成)</b>\n\n"
+    
     html += f"<b>🕒 实时行情快照 (JST)</b>\n"
     html += f"• <b>最新报价：</b> {cp} USDT\n"
-    html += f"• <b>抓取时间：</b> {dt}\n"
+    html += f"• <b>抓取时间：</b> {dt} (东京时间)\n"
     html += f"• <b>行情来源：</b> {src}\n\n"
     
     html += f"<b>📊 行情主基调</b>\n"
-    html += f"• <b>日线：</b> {trends['Daily_Trend']}\n"
-    html += f"• <b>周线：</b> {trends['Weekly_Trend']}\n\n"
+    html += f"• <b>日线级别：</b> {trends['Daily_Trend']}\n"
+    html += f"• <b>周线级别：</b> {trends['Weekly_Trend']}\n\n"
     
     html += f"<b>📈 动能与空间定量</b>\n"
-    html += f"• <b>布林带：</b> {moms['Bollinger_Position']}\n"
-    html += f"• <b>日线RSI：</b> {moms['Daily_RSI']} | <b>周线RSI：</b> {moms['Weekly_RSI']}\n"
-    html += f"• <b>量能：</b> {moms['Volume_and_MACD']}\n\n"
+    html += f"• <b>布林带位置：</b> {moms['Bollinger_Position']}\n"
+    html += f"• <b>日线 RSI：</b> {moms['Daily_RSI']}\n"
+    html += f"• <b>周线 RSI：</b> {moms['Weekly_RSI']}\n"
+    html += f"• <b>MACD 与量能：</b> {moms['Volume_and_MACD']}\n\n"
     
     html += f"<b>🎯 核心兵家必争之地</b>\n"
     html += f"• <b>下方支撑：</b>\n"
     for s in sr['Below_Price_Supports'][:2]: html += f"  • {s}\n"
     html += f"• <b>上方阻力：</b>\n"
-    for r in sr['Above_Price_Resistances'][:2]: html += f"  • {r}\n"
+    for r in sr['Above_Price_Resistances'][:2]: html += f"  • {r}\n\n"
         
+    html += f"<b>🔮 周期级趋势预测与演推</b>\n"
+    html += f"• <b>未来 1-3 天走势预测（基于日线级别）：</b>\n"
+    html += f"  {short_pred}\n\n"
+    html += f"• <b>未来 1-4 周趋势前瞻（基于周线大势）：</b>\n"
+    html += f"  {long_pred}"
+    
     return html
 
 def analyze_with_local_llm(context_dict):
@@ -241,10 +274,14 @@ def analyze_with_local_llm(context_dict):
     • <b>行情来源：</b> Price_Source
 
     <b>📊 行情主基调</b>
-    (严格复述 Explicit_Trend_Labels)
+    • <b>日线级别：</b> (提取日线结论)
+    • <b>周线级别：</b> (提取周线结论)
 
     <b>📈 动能与空间定量</b>
-    (严格复述 Explicit_Momentum_Labels)
+    • <b>布林带位置：</b> (提取布林带)
+    • <b>日线 RSI：</b> (提取日线RSI)
+    • <b>周线 RSI：</b> (提取周线RSI)
+    • <b>MACD 与量能：</b> (提取量能)
 
     <b>🎯 核心兵家必争之地</b>
     • <b>下方支撑：</b>(提取 Below_Price_Supports 前两项)
@@ -273,7 +310,7 @@ def analyze_with_local_llm(context_dict):
     except Exception as e:
         return f"<b>❌ 连接失败</b>\n连接 LM Studio 失败。错误信息: {e}"
 
-# 生成报告并绑定按钮（LLM 或 Fast 模式通用底层）
+# 生成报告并绑定按钮（通用底层）
 def get_standard_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 AI 深度分析", callback_data='run_llm'),
@@ -291,7 +328,7 @@ async def generate_and_send_report(bot, chat_id, edit_message_id=None, use_llm=T
         if use_llm:
             report = await loop.run_in_executor(None, analyze_with_local_llm, market_data_dict)
         else:
-            report = format_fast_snapshot(market_data_dict) # 绕过大模型，纯本地渲染
+            report = format_fast_snapshot(market_data_dict) 
             
         reply_markup = get_standard_keyboard()
 
@@ -306,12 +343,11 @@ async def generate_and_send_report(bot, chat_id, edit_message_id=None, use_llm=T
 
 async def cmd_run_llm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ALLOWED_USER_ID: return
-    status_message = await update.message.reply_text("🔄 正在生成双周期专业研报...")
+    status_message = await update.message.reply_text("🔄 正在唤醒大模型生成双周期专业研报...")
     await generate_and_send_report(context.bot, ALLOWED_USER_ID, status_message.message_id, use_llm=True)
 
 async def cmd_run_fast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ALLOWED_USER_ID: return
-    # 极速快照直接下发，不需要“正在生成”提示
     await generate_and_send_report(context.bot, ALLOWED_USER_ID, use_llm=False)
 
 async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -368,10 +404,9 @@ async def price_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 def main():
-    print("🤖 终极量化外挂：快慢双规引擎启动。早8点、晚7点例行深度研报。")
+    print("🤖 量化外挂升级：极速快照已完全对齐 LLM 结构，部署硬核逻辑推演功能！")
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # 注册菜单命令
     async def setup_bot(app):
         commands = [
             ("run", "🚀 AI 深度综合技术分析"),
@@ -385,7 +420,6 @@ def main():
     loop = asyncio.get_event_loop()
     loop.run_until_complete(setup_bot(application))
 
-    # 调整为东京时间 早上 8:00 和 晚上 19:00 (7:00 PM)
     job_queue = application.job_queue
     job_queue.run_daily(daily_digest, time=time(hour=8, minute=0, tzinfo=TOKYO_TZ), chat_id=ALLOWED_USER_ID)
     job_queue.run_daily(daily_digest, time=time(hour=19, minute=0, tzinfo=TOKYO_TZ), chat_id=ALLOWED_USER_ID)
