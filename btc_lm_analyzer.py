@@ -158,7 +158,14 @@ def get_market_data():
     
     pct_change = df_daily['Close'].pct_change().abs().iloc[-1]
     if pct_change > 0.50: raise Exception("检测到单日振幅>50%，Yahoo数据源可能遭遇插针污染，拒绝分析。")
+    
     latest_d = df_daily.iloc[-1]
+
+    # 【终极判断核心】提取昨日 K 线数据计算枢轴点 (Pivot Points)
+    prev_d = df_daily.iloc[-2]
+    PP = (prev_d['High'] + prev_d['Low'] + prev_d['Close']) / 3
+    R1 = 2 * PP - prev_d['Low']
+    S1 = 2 * PP - prev_d['High']
 
     # --- 周线历史底座 ---
     df_weekly = btc.history(period="5y", interval="1wk")
@@ -172,6 +179,7 @@ def get_market_data():
 
     # --- 实时数据与订单簿获取 (Binance) ---
     order_book_status = "数据获取失败"
+    imbalance = 1.0
     try:
         exchange = ccxt.binance({'timeout': 3000})
         ticker = exchange.fetch_ticker('BTC/USDT')
@@ -182,7 +190,7 @@ def get_market_data():
         orderbook = exchange.fetch_order_book('BTC/USDT', limit=50)
         bids_vol = sum(bid[1] for bid in orderbook['bids']) 
         asks_vol = sum(ask[1] for ask in orderbook['asks']) 
-        imbalance = bids_vol / asks_vol if asks_vol > 0 else 1
+        imbalance = bids_vol / asks_vol if asks_vol > 0 else 1.0
         
         if imbalance > 1.5: order_book_status = "买盘挂单极强 (下方托盘厚实)"
         elif imbalance < 0.66: order_book_status = "卖盘挂单沉重 (上方抛压如山)"
@@ -202,6 +210,16 @@ def get_market_data():
         "周线 EMA20": latest_w['EMA_20'], "周线 EMA50": latest_w['EMA_50'], "周线 EMA200": latest_w['EMA_200']
     }
     supports, resistances = calculate_support_resistance(current_price, all_levels)
+
+    # 安全提取情绪数值用于打分引擎
+    fng_val = 50
+    funding_val = 0.0
+    if '获取失败' not in sentiment['fng']:
+        try: fng_val = int(sentiment['fng'].split(' ')[0])
+        except: pass
+    if '获取失败' not in sentiment['funding']:
+        try: funding_val = float(sentiment['funding'].split('%')[0])
+        except: pass
 
     context = {
         "Asset": "BTC-USDT",
@@ -227,36 +245,98 @@ def get_market_data():
         "Explicit_Support_and_Resistance": {
             "Below_Price_Supports": supports,
             "Above_Price_Resistances": resistances
+        },
+        # 【终极判断核心】供打分引擎读取的原始数值
+        "Raw_Data_For_Scoring": {
+            "EMA20": latest_d['EMA_20'],
+            "EMA50": latest_d['EMA_50'],
+            "MACD": latest_d['MACD_Histogram'],
+            "OBV_Up": latest_d['OBV'] > latest_d['OBV_MA'],
+            "ATR": latest_d['ATR'],
+            "OrderBookRatio": imbalance,
+            "FNG_Value": fng_val,
+            "Funding_Value": funding_val,
+            "Pivot_PP": PP,
+            "Pivot_R1": R1,
+            "Pivot_S1": S1
         }
     }
     return context
 
-def generate_algo_prediction(context_dict):
-    trends = context_dict["Explicit_Trend_Labels"]
-    moms = context_dict["Explicit_Momentum_Labels"]
-    vol = context_dict["Volatility_and_Sentiment"]
+# --- 🔥 新增：量化多因子交易信号生成引擎 🔥 ---
+def generate_trading_signal(ctx):
+    price = ctx["Current_Price"]
+    raw = ctx["Raw_Data_For_Scoring"]
+    atr = raw["ATR"]
     
-    short_pred = ""
-    if "多头排列" in trends['Daily_Trend']:
-        if "资金暗中吸筹" in moms['Volume_and_MACD'] and "买盘挂单极强" in vol['Order_Book_Imbalance']:
-            short_pred = "日线多头排列且 OBV 显示资金吸筹，叠加实时盘口买盘强劲，短线具备极强向上突破动能，有望加速冲击上方阻力位。"
-        elif "缩量" in moms['Volume_and_MACD'] or "抛压如山" in vol['Order_Book_Imbalance']:
-            short_pred = "日线虽维持多头排列，但盘口抛压较重或量能不足，提防主力诱多。短线或在当前区间剧烈震荡，日均波动幅度预估为 " + str(vol['Daily_ATR_Volatility']) + " USDT。"
-        else:
-            short_pred = "日线呈多头结构运行，各项指标平稳，短线有望依托 EMA20 支撑稳步向上震荡。"
-    else:
-        if "存在超卖反弹预期" in moms['Bollinger_Position'] and "资金暗中吸筹" in moms['Volume_and_MACD']:
-            short_pred = "价格极度贴近下轨且引发超卖，但 OBV 呈现底背离（资金未跟随价格流出），短线随时可能触发报复性反弹，重点观察盘口买单承接力。"
-        else:
-            short_pred = "日线空头压制明显，且大资金未见回补迹象。在当前 " + str(vol['Daily_ATR_Volatility']) + " USDT 的日均波动率下，短线仍有向下寻底风险，切忌盲目抄底。"
+    score = 0
+    # 1. 趋势因子 (-2 到 +2)
+    if price > raw["EMA20"]: score += 1
+    elif price < raw["EMA20"]: score -= 1
+    if raw["EMA20"] > raw["EMA50"]: score += 1
+    elif raw["EMA20"] < raw["EMA50"]: score -= 1
+    
+    # 2. 动能因子 (-2 到 +2)
+    if raw["MACD"] > 0: score += 1
+    else: score -= 1
+    if raw["OBV_Up"]: score += 1
+    else: score -= 1
+    
+    # 3. 盘口与情绪因子 (-2 到 +2)
+    if raw["OrderBookRatio"] > 1.5: score += 1
+    elif raw["OrderBookRatio"] < 0.66: score -= 1
+    
+    # 情绪逆向：极度恐慌且费率为负 = 底部特征；极度贪婪且费率极高 = 顶部特征
+    if raw["FNG_Value"] < 30 and raw["Funding_Value"] < 0: score += 1
+    elif raw["FNG_Value"] > 75 and raw["Funding_Value"] > 0.05: score -= 1
 
-    long_pred = ""
-    if "宏观熊市" in trends['Weekly_Trend']:
-        long_pred = "周线跌破牛熊分水岭，宏观格局维持熊市压制。在全网情绪处于 " + vol['Fear_Greed_Index'] + " 的背景下，大周期资金观望情绪浓厚。若无极强宏观利好刺激放量，周线级别将继续寻底。"
-    else:
-        long_pred = "周线稳居牛熊分水岭之上，长线牛市基座稳固。大周期多头结构未被破坏，建议在日线级别的每一次深度回调中（靠近强支撑位）寻找介入机会。"
+    # 生成决策
+    action, signal = "⏳ 观望 (Neutral)", "当前多空力量均衡，指标存在分歧，建议空仓等待明确方向。"
+    entry, sl, tp1, tp2 = 0, 0, 0, 0
+    
+    if score >= 4:
+        action = "🚀 强力做多 (Strong Long)"
+        signal = "多头多因子共振，趋势、动能、资金全面向好。短线具备强冲高动能。"
+        entry = price
+        sl = price - (1.5 * atr) # ATR 动态止损
+        tp1 = price + (2 * atr)  # 1:1.33 盈亏比
+        tp2 = raw["Pivot_R1"]    # 上方第一枢轴阻力
+    elif 1 <= score <= 3:
+        action = "📈 逢低做多 (Buy the Dip)"
+        signal = "大方向偏多，但动能不具备绝对优势。切勿追高，等待回踩支撑位接多。"
+        entry = raw["Pivot_PP"] if price > raw["Pivot_PP"] else raw["EMA20"]
+        sl = entry - (1.5 * atr)
+        tp1 = entry + (2 * atr)
+        tp2 = raw["Pivot_R1"]
+    elif -3 <= score <= -1:
+        action = "📉 逢高做空 (Sell the Rip)"
+        signal = "大方向偏空，空方占据主导。反弹动能较弱，等待测试阻力位试空。"
+        entry = raw["Pivot_PP"] if price < raw["Pivot_PP"] else raw["EMA20"]
+        sl = entry + (1.5 * atr)
+        tp1 = entry - (2 * atr)
+        tp2 = raw["Pivot_S1"]
+    elif score <= -4:
+        action = "🩸 强力做空 (Strong Short)"
+        signal = "空头多因子共振，盘面极度弱势。下方支撑面临严峻考验。"
+        entry = price
+        sl = price + (1.5 * atr)
+        tp1 = price - (2 * atr)
+        tp2 = raw["Pivot_S1"]
 
-    return short_pred, long_pred
+    html = f"<b>🎯 量化交易执行指令 (多空评分: {score}/6)</b>\n"
+    html += f"• <b>最终判决：</b> {action}\n"
+    html += f"• <b>逻辑归因：</b> {signal}\n\n"
+    
+    if "观望" not in action:
+        html += f"<b>⚔️ 沙盒操盘计划 (基于 {atr:.0f} USDT 动态波动率计算)</b>\n"
+        html += f"• <b>预期建仓区间：</b> <code>{entry:.2f}</code> 附近\n"
+        html += f"• <b>🚩 铁律止损位：</b> <code>{sl:.2f}</code> (若触碰立刻平仓)\n"
+        html += f"• <b>💰 保本止盈位：</b> <code>{tp1:.2f}</code> (标准盈亏比)\n"
+        html += f"• <b>💎 极限目标位：</b> <code>{tp2:.2f}</code> (枢轴点空间)\n"
+    else:
+        html += f"<b>⚔️ 操盘计划</b>\n• 管住手，休息也是交易系统的重要组成部分。\n"
+        
+    return html
 
 def format_fast_snapshot(context_dict):
     cp = context_dict["Current_Price"]
@@ -267,7 +347,8 @@ def format_fast_snapshot(context_dict):
     vol = context_dict["Volatility_and_Sentiment"]
     sr = context_dict["Explicit_Support_and_Resistance"]
     
-    short_pred, long_pred = generate_algo_prediction(context_dict)
+    # 极速快照尾部移除原来的 generate_algo_prediction，直接调用终极判决
+    signal_html = generate_trading_signal(context_dict)
     
     html = f"⚡ <b>毫秒级极速快照 (融合 OBV/ATR/盘口)</b>\n\n"
     html += f"<b>🕒 行情快照 (JST)</b>\n"
@@ -289,21 +370,29 @@ def format_fast_snapshot(context_dict):
     for s in sr['Below_Price_Supports'][:2]: html += f"  • {s}\n"
     html += f"• 上方阻力：\n"
     for r in sr['Above_Price_Resistances'][:2]: html += f"  • {r}\n\n"
-    html += f"<b>🔮 周期级推演预判 (算法自动生成)</b>\n"
-    html += f"• <b>未来 1-3 天 (短线博弈)：</b>\n  {short_pred}\n\n"
-    html += f"• <b>未来 1-4 周 (宏观趋势)：</b>\n  {long_pred}"
+    
+    html += f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
+    html += signal_html
     return html
 
 def analyze_with_local_llm(context_dict):
-    data_json = json.dumps(context_dict, indent=2, ensure_ascii=False)
+    # 先剥离出不需要喂给大模型的原始打分数据，减轻 JSON 负担
+    clean_ctx = {k: v for k, v in context_dict.items() if k != "Raw_Data_For_Scoring"}
+    data_json = json.dumps(clean_ctx, indent=2, ensure_ascii=False)
+    
+    signal_html = generate_trading_signal(context_dict)
     client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
     
-    system_prompt = """
+    system_prompt = f"""
     你是一个负责排版和语言润色的顶级量化金融播报员。
     
     【最高指令：绝对服从 Python】
     所有的趋势定性、OBV筹码、盘口深度、ATR波动率等，均已在数据中为你算好。
     用流畅、充满机构交易员专业语气的中文，将这些结论组合成清晰的报告。绝对照抄预设结论，禁止自行修改。
+    
+    点评结束后，**必须原封不动、一字不差地**将以下这套系统给出的最终操作指令抄写在报告的最下方！
+    系统指令文本如下：
+    {signal_html}
     
     【排版要求】
     1. 必须遵守 Telegram HTML 限制，仅使用 <b> 加粗。
@@ -325,6 +414,8 @@ def analyze_with_local_llm(context_dict):
 
     <b>🔮 周期级趋势预测与演推</b>
     • 结合上述盘口、OBV吸筹状态、波动率及均线，分别写出 1-3 天和 1-4 周的前瞻推演。
+    
+    (在此处插入系统指令文本)
     """
     try:
         response = client.chat.completions.create(
@@ -347,21 +438,25 @@ def analyze_with_local_llm(context_dict):
 # ================= Telegram 交互与主循环 =================
 
 def get_standard_keyboard():
-    # 恢复五宫格全键盘
+    # 增加独立的终极判决按钮
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 AI 深度分析", callback_data='run_llm'),
          InlineKeyboardButton("⚡ 极速快照", callback_data='run_fast')],
-        [InlineKeyboardButton("📈 资金费率", callback_data='funding'),
+        [InlineKeyboardButton("🎯 终极判决 (信号)", callback_data='signal'),
          InlineKeyboardButton("📊 24h概况", callback_data='summary')],
-        [InlineKeyboardButton("🧭 恐慌贪婪指数", callback_data='fng')]
+        [InlineKeyboardButton("📈 资金费率", callback_data='funding'),
+         InlineKeyboardButton("🧭 恐慌贪婪指数", callback_data='fng')]
     ])
 
-async def generate_and_send_report(bot, chat_id, edit_message_id=None, use_llm=True):
+async def generate_and_send_report(bot, chat_id, edit_message_id=None, use_llm=True, only_signal=False):
     try:
         loop = asyncio.get_event_loop()
         market_data_dict = await loop.run_in_executor(None, get_market_data)
         
-        if use_llm:
+        # 处理不同的指令请求
+        if only_signal:
+            report = f"🤖 <b>系统剥离行情，纯净执行信号：</b>\n\n{generate_trading_signal(market_data_dict)}"
+        elif use_llm:
             report = await loop.run_in_executor(None, analyze_with_local_llm, market_data_dict)
         else:
             report = format_fast_snapshot(market_data_dict) 
@@ -384,6 +479,10 @@ async def cmd_run_llm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_run_fast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ALLOWED_USER_ID: return
     await generate_and_send_report(context.bot, ALLOWED_USER_ID, use_llm=False)
+
+async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ALLOWED_USER_ID: return
+    await generate_and_send_report(context.bot, ALLOWED_USER_ID, only_signal=True)
 
 async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ALLOWED_USER_ID: return
@@ -408,6 +507,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await generate_and_send_report(context.bot, ALLOWED_USER_ID, query.message.message_id, use_llm=True)
     elif query.data == 'run_fast':
         await generate_and_send_report(context.bot, ALLOWED_USER_ID, query.message.message_id, use_llm=False)
+    elif query.data == 'signal':
+        await generate_and_send_report(context.bot, ALLOWED_USER_ID, query.message.message_id, only_signal=True)
     elif query.data == 'funding':
         await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=get_live_funding_rate(), parse_mode="HTML", reply_markup=get_standard_keyboard())
     elif query.data == 'summary':
@@ -434,7 +535,6 @@ async def price_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         dt = data["Data_Timestamp_JST"]
 
         # 重新单独拉取一次精准盘口数据，提取具体挂单量用于展示
-        # 这里使用极其安全的公开免密接口
         import ccxt
         exchange = ccxt.binance({'timeout': 2000})
         orderbook = exchange.fetch_order_book('BTC/USDT', limit=50)
@@ -465,11 +565,11 @@ async def price_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"• 数据来源：{src}\n"
                 f"• 抓取时间：{dt}\n\n"
                 f"<b>🔍 异动指标详情</b>\n"
-                f"{alert}"
+                f"{alert}\n"
+                f"<i>💡 建议点击下方 /signal 获取最新买卖判定。</i>"
             )
             await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode="HTML")
     except Exception as e:
-        # 静默盯盘，报错不中断主进程
         print(f"⚠️ 盯盘监控运行中遭遇偶发异常: {e}")
 
 # ================= 永续运行与网络守护 =================
@@ -486,7 +586,7 @@ def wait_for_internet():
             time.sleep(30)
 
 def main():
-    print("🤖 量化外挂：快慢双规引擎启动。")
+    print("🤖 量化外挂：终极双轨判定引擎启动。")
     while True:
         try:
             # 1. 确保网络就绪
@@ -498,8 +598,9 @@ def main():
             # 注册命令
             async def setup_bot(app):
                 await app.bot.set_my_commands([
-                    ("fast", "⚡ 毫秒级极速数据快照"),
-                    ("run", "🚀 AI 深度综合技术分析"),
+                    ("fast", "⚡ 极速快照 (含交易信号)"),
+                    ("run", "🚀 AI 深度分析 (含交易信号)"),
+                    ("signal", "🎯 纯净交易指令 (入场/止损)"),
                     ("funding", "📈 实时资金费率"),
                     ("summary", "📊 24小时盘面概况"),
                     ("fng", "🧭 恐慌贪婪指数")
@@ -517,6 +618,7 @@ def main():
             # 绑定处理器
             application.add_handler(CommandHandler("run", cmd_run_llm))
             application.add_handler(CommandHandler("fast", cmd_run_fast))
+            application.add_handler(CommandHandler("signal", cmd_signal))
             application.add_handler(CommandHandler("funding", cmd_funding))
             application.add_handler(CommandHandler("summary", cmd_summary))
             application.add_handler(CommandHandler("fng", cmd_fng))
