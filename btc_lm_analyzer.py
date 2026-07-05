@@ -82,7 +82,6 @@ def rsi_status(rsi_value):
 # ================= 独立功能数据接口 =================
 
 def get_live_funding_rate():
-    """供独立按钮和命令使用"""
     try:
         exchange = ccxt.binance({'timeout': 3000})
         funding = exchange.fetch_funding_rate('BTC/USDT:USDT')
@@ -93,7 +92,6 @@ def get_live_funding_rate():
         return f"❌ 获取资金费率失败: {e}"
 
 def get_fear_and_greed():
-    """供独立按钮和命令使用"""
     try:
         resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()
         val = resp['data'][0]['value']
@@ -103,7 +101,6 @@ def get_fear_and_greed():
         return f"❌ 获取恐慌贪婪指数失败: {e}"
 
 def get_24h_summary():
-    """供独立按钮和命令使用"""
     try:
         exchange = ccxt.binance({'timeout': 3000})
         ticker = exchange.fetch_ticker('BTC/USDT')
@@ -117,7 +114,6 @@ def get_24h_summary():
         return f"❌ 获取24小时概况失败: {e}"
 
 def fetch_sentiment_data():
-    """供核心研报聚合使用"""
     sentiment = {"funding": "获取失败", "fng": "获取失败"}
     try:
         ex = ccxt.binance({'timeout': 3000})
@@ -135,7 +131,6 @@ def fetch_sentiment_data():
 def get_market_data():
     btc = yf.Ticker("BTC-USD")
     
-    # --- 日线历史底座与核心指标计算 ---
     df_daily = btc.history(period="1y", interval="1d")
     df_daily.index = df_daily.index.tz_localize(None)
     df_daily['EMA_20'] = EMAIndicator(close=df_daily['Close'], window=20).ema_indicator()
@@ -161,13 +156,13 @@ def get_market_data():
     
     latest_d = df_daily.iloc[-1]
 
-    # 【终极判断核心】提取昨日 K 线数据计算枢轴点 (Pivot Points)
+    # 【风控核心】计算昨日 Pivot Points 枢轴点
     prev_d = df_daily.iloc[-2]
     PP = (prev_d['High'] + prev_d['Low'] + prev_d['Close']) / 3
     R1 = 2 * PP - prev_d['Low']
     S1 = 2 * PP - prev_d['High']
 
-    # --- 周线历史底座 ---
+    # 周线历史底座
     df_weekly = btc.history(period="5y", interval="1wk")
     df_weekly.index = df_weekly.index.tz_localize(None)
     df_weekly['EMA_20'] = EMAIndicator(close=df_weekly['Close'], window=20).ema_indicator()
@@ -177,7 +172,7 @@ def get_market_data():
     df_weekly.dropna(inplace=True)
     latest_w = df_weekly.iloc[-1]
 
-    # --- 实时数据与订单簿获取 (Binance) ---
+    # 实时盘口
     order_book_status = "数据获取失败"
     imbalance = 1.0
     try:
@@ -197,7 +192,6 @@ def get_market_data():
         else: order_book_status = "买卖盘口势均力敌"
 
     except Exception as e:
-        print(f"⚠️ 币安连接失败，降级使用雅虎数据: {e}")
         current_price = round(latest_d['Close'], 2)
         data_time = pd.Timestamp.now(tz='Asia/Tokyo').strftime('%Y-%m-%d %H:%M:%S')
         price_source = "Yahoo (延迟)"
@@ -212,8 +206,7 @@ def get_market_data():
     supports, resistances = calculate_support_resistance(current_price, all_levels)
 
     # 安全提取情绪数值用于打分引擎
-    fng_val = 50
-    funding_val = 0.0
+    fng_val, funding_val = 50, 0.0
     if '获取失败' not in sentiment['fng']:
         try: fng_val = int(sentiment['fng'].split(' ')[0])
         except: pass
@@ -246,13 +239,14 @@ def get_market_data():
             "Below_Price_Supports": supports,
             "Above_Price_Resistances": resistances
         },
-        # 【终极判断核心】供打分引擎读取的原始数值
         "Raw_Data_For_Scoring": {
             "EMA20": latest_d['EMA_20'],
             "EMA50": latest_d['EMA_50'],
             "MACD": latest_d['MACD_Histogram'],
             "OBV_Up": latest_d['OBV'] > latest_d['OBV_MA'],
             "ATR": latest_d['ATR'],
+            "BB_H": latest_d['BB_High'],
+            "BB_L": latest_d['BB_Low'],
             "OrderBookRatio": imbalance,
             "FNG_Value": fng_val,
             "Funding_Value": funding_val,
@@ -263,78 +257,97 @@ def get_market_data():
     }
     return context
 
-# --- 🔥 新增：量化多因子交易信号生成引擎 🔥 ---
+# --- 🔥 全新升级：量化严苛风控打分引擎 🔥 ---
 def generate_trading_signal(ctx):
     price = ctx["Current_Price"]
     raw = ctx["Raw_Data_For_Scoring"]
     atr = raw["ATR"]
     
+    # 【因子打分引擎】
     score = 0
-    # 1. 趋势因子 (-2 到 +2)
     if price > raw["EMA20"]: score += 1
     elif price < raw["EMA20"]: score -= 1
     if raw["EMA20"] > raw["EMA50"]: score += 1
     elif raw["EMA20"] < raw["EMA50"]: score -= 1
-    
-    # 2. 动能因子 (-2 到 +2)
     if raw["MACD"] > 0: score += 1
     else: score -= 1
     if raw["OBV_Up"]: score += 1
     else: score -= 1
-    
-    # 3. 盘口与情绪因子 (-2 到 +2)
     if raw["OrderBookRatio"] > 1.5: score += 1
     elif raw["OrderBookRatio"] < 0.66: score -= 1
     
-    # 情绪逆向：极度恐慌且费率为负 = 底部特征；极度贪婪且费率极高 = 顶部特征
+    # 逆向情绪加持
     if raw["FNG_Value"] < 30 and raw["Funding_Value"] < 0: score += 1
     elif raw["FNG_Value"] > 75 and raw["Funding_Value"] > 0.05: score -= 1
 
-    # 生成决策
-    action, signal = "⏳ 观望 (Neutral)", "当前多空力量均衡，指标存在分歧，建议空仓等待明确方向。"
-    entry, sl, tp1, tp2 = 0, 0, 0, 0
+    action, signal = "⏳ 观望 (Neutral)", "指标分歧，空仓等待方向。"
+    entry, sl, tp1, tp2, rr_ratio = 0, 0, 0, 0, 0
     
-    if score >= 4:
-        action = "🚀 强力做多 (Strong Long)"
-        signal = "多头多因子共振，趋势、动能、资金全面向好。短线具备强冲高动能。"
-        entry = price
-        sl = price - (1.5 * atr) # ATR 动态止损
-        tp1 = price + (2 * atr)  # 1:1.33 盈亏比
-        tp2 = raw["Pivot_R1"]    # 上方第一枢轴阻力
-    elif 1 <= score <= 3:
-        action = "📈 逢低做多 (Buy the Dip)"
-        signal = "大方向偏多，但动能不具备绝对优势。切勿追高，等待回踩支撑位接多。"
-        entry = raw["Pivot_PP"] if price > raw["Pivot_PP"] else raw["EMA20"]
-        sl = entry - (1.5 * atr)
-        tp1 = entry + (2 * atr)
-        tp2 = raw["Pivot_R1"]
-    elif -3 <= score <= -1:
-        action = "📉 逢高做空 (Sell the Rip)"
-        signal = "大方向偏空，空方占据主导。反弹动能较弱，等待测试阻力位试空。"
-        entry = raw["Pivot_PP"] if price < raw["Pivot_PP"] else raw["EMA20"]
-        sl = entry + (1.5 * atr)
-        tp1 = entry - (2 * atr)
-        tp2 = raw["Pivot_S1"]
-    elif score <= -4:
-        action = "🩸 强力做空 (Strong Short)"
-        signal = "空头多因子共振，盘面极度弱势。下方支撑面临严峻考验。"
-        entry = price
-        sl = price + (1.5 * atr)
-        tp1 = price - (2 * atr)
-        tp2 = raw["Pivot_S1"]
+    # ================= 多头风控逻辑 =================
+    if score >= 1: 
+        is_strong = (score >= 4)
+        action = "🚀 强力做多 (Strong Long)" if is_strong else "📈 逢低接多 (Buy the Dip)"
+        signal = "多因子共振，具备强冲高动能。" if is_strong else "大方向偏多，切勿追高，等回踩支撑进场。"
+        
+        # 1. 锚定建仓位
+        entry = price if is_strong else min(price, raw["EMA20"])
+        
+        # 2. 结构防插针止损位 (1.5 ATR 与 布林带下轨 的博弈)
+        sl_math = entry - (1.5 * atr)
+        sl = min(sl_math, raw["BB_L"] * 0.998) # 若数学止损悬在半空，强制下调至下轨下方 0.2%
+        risk = entry - sl
+        
+        # 3. 止盈倒挂纠正机制 (寻找前方有效阻力)
+        valid_resistances = [x for x in [raw["Pivot_R1"], raw["BB_H"], entry + 2*atr] if x > entry]
+        tp1 = min(valid_resistances) # 减仓第一目标：最近阻力
+        tp2 = max(valid_resistances) # 终极波段目标：最远阻力
+        
+        # 4. 盈亏比熔断器计算
+        rr_ratio = (tp1 - entry) / risk if risk > 0 else 0
+        
+        if rr_ratio < 1.5:
+            action = f"⏳ 放弃多单 (风控熔断)"
+            signal = f"方向虽偏多，但上方最近阻力 ({tp1:.0f}) 空间受限。预期盈亏比仅为 <b>{rr_ratio:.2f}</b> (<1.5)，且止损成本过高，强行建仓易受损，放弃。"
 
-    html = f"<b>🎯 量化交易执行指令 (多空评分: {score}/6)</b>\n"
-    html += f"• <b>最终判决：</b> {action}\n"
+    # ================= 空头风控逻辑 =================
+    elif score <= -1:
+        is_strong = (score <= -4)
+        action = "🩸 强力做空 (Strong Short)" if is_strong else "📉 逢高做空 (Sell the Rip)"
+        signal = "空头共振，顺势直接下空。" if is_strong else "大方向偏空，反弹动能极弱，依托阻力空。"
+        
+        entry = price if is_strong else max(price, raw["EMA20"])
+        
+        # 结构防插针止损 (1.5 ATR 与 布林带上轨 博弈)
+        sl_math = entry + (1.5 * atr)
+        sl = max(sl_math, raw["BB_H"] * 1.002) # 强制上调至布林带上轨上方 0.2%
+        risk = sl - entry
+        
+        # 止盈倒挂纠正机制 (寻找下方有效支撑)
+        valid_supports = [x for x in [raw["Pivot_S1"], raw["BB_L"], entry - 2*atr] if x < entry]
+        tp1 = max(valid_supports) # 减仓第一目标：最高价(最近支撑)
+        tp2 = min(valid_supports) # 终极波段目标：最低价(最深支撑)
+        
+        # 盈亏比熔断器计算
+        rr_ratio = (entry - tp1) / risk if risk > 0 else 0
+        
+        if rr_ratio < 1.5:
+            action = f"⏳ 放弃空单 (风控熔断)"
+            signal = f"方向虽偏空，但下方最近支撑 ({tp1:.0f}) 过近。预期盈亏比仅为 <b>{rr_ratio:.2f}</b> (<1.5)，反抽扫损风险极大，放弃。"
+
+    # ================= 输出排版 =================
+    html = f"<b>🎯 终极量化判决 (多空倾向: {score}/6)</b>\n"
+    html += f"• <b>执行动作：</b> {action}\n"
     html += f"• <b>逻辑归因：</b> {signal}\n\n"
     
-    if "观望" not in action:
-        html += f"<b>⚔️ 沙盒操盘计划 (基于 {atr:.0f} USDT 动态波动率计算)</b>\n"
-        html += f"• <b>预期建仓区间：</b> <code>{entry:.2f}</code> 附近\n"
-        html += f"• <b>🚩 铁律止损位：</b> <code>{sl:.2f}</code> (若触碰立刻平仓)\n"
-        html += f"• <b>💰 保本止盈位：</b> <code>{tp1:.2f}</code> (标准盈亏比)\n"
-        html += f"• <b>💎 极限目标位：</b> <code>{tp2:.2f}</code> (枢轴点空间)\n"
-    else:
-        html += f"<b>⚔️ 操盘计划</b>\n• 管住手，休息也是交易系统的重要组成部分。\n"
+    if "放弃" not in action and "观望" not in action:
+        html += f"<b>⚔️ 严苛风控操盘计划 (ATR 倒推)</b>\n"
+        html += f"• <b>预期建仓：</b> <code>{entry:.2f}</code> 附近\n"
+        html += f"• <b>🚩 结构止损：</b> <code>{sl:.2f}</code> (防插针保护)\n"
+        html += f"• <b>💰 第一减仓：</b> <code>{tp1:.2f}</code> (盈亏比 {rr_ratio:.2f})\n"
+        html += f"• <b>💎 极限目标：</b> <code>{tp2:.2f}</code> (阻力/支撑区间)\n"
+    elif "放弃" in action:
+        html += f"<b>🛡️ 拒绝理由 (管住手是交易的一部分)</b>\n"
+        html += f"• 系统测算本次交易胜率与盈亏比不匹配。强制阻止开仓操作。\n"
         
     return html
 
@@ -347,157 +360,105 @@ def format_fast_snapshot(context_dict):
     vol = context_dict["Volatility_and_Sentiment"]
     sr = context_dict["Explicit_Support_and_Resistance"]
     
-    # 极速快照尾部移除原来的 generate_algo_prediction，直接调用终极判决
     signal_html = generate_trading_signal(context_dict)
     
-    html = f"⚡ <b>毫秒级极速快照 (融合 OBV/ATR/盘口)</b>\n\n"
-    html += f"<b>🕒 行情快照 (JST)</b>\n"
-    html += f"• 最新报价： {cp} USDT\n"
-    html += f"• 抓取时间： {dt}\n"
-    html += f"• 行情来源： {src}\n\n"
-    html += f"<b>📊 行情主基调</b>\n"
-    html += f"• 日线级别： {trends['Daily_Trend']}\n"
-    html += f"• 周线级别： {trends['Weekly_Trend']}\n\n"
+    html = f"⚡ <b>毫秒级极速快照 (带严苛风控引擎)</b>\n\n"
+    html += f"<b>🕒 行情快照 (JST)</b>\n• 最新报价： {cp} USDT\n• 抓取时间： {dt}\n• 行情来源： {src}\n\n"
+    html += f"<b>📊 行情主基调</b>\n• 日线： {trends['Daily_Trend']}\n• 周线： {trends['Weekly_Trend']}\n\n"
     html += f"<b>📈 动能、筹码与情绪</b>\n"
-    html += f"• 布林带位置： {moms['Bollinger_Position']}\n"
-    html += f"• RSI指标： 日线 {moms['Daily_RSI']} | 周线 {moms['Weekly_RSI']}\n"
-    html += f"• 量价配合： {moms['Volume_and_MACD']}\n"
-    html += f"• 实时挂单(深度)： {vol['Order_Book_Imbalance']}\n"
-    html += f"• 波动率(ATR)： 日均波动 {vol['Daily_ATR_Volatility']} USDT\n"
-    html += f"• 宏观情绪： F&G {vol['Fear_Greed_Index']} | 费率 {vol['Funding_Rate']}\n\n"
+    html += f"• 布林带： {moms['Bollinger_Position']}\n"
+    html += f"• RSI： 日线 {moms['Daily_RSI']} | 周线 {moms['Weekly_RSI']}\n"
+    html += f"• 量价： {moms['Volume_and_MACD']}\n"
+    html += f"• 盘口： {vol['Order_Book_Imbalance']}\n"
+    html += f"• 波动率： 日均波动 {vol['Daily_ATR_Volatility']} USDT\n"
+    html += f"• 情绪： F&G {vol['Fear_Greed_Index']} | 费率 {vol['Funding_Rate']}\n\n"
     html += f"<b>🎯 核心兵家必争之地</b>\n"
     html += f"• 下方支撑：\n"
     for s in sr['Below_Price_Supports'][:2]: html += f"  • {s}\n"
     html += f"• 上方阻力：\n"
     for r in sr['Above_Price_Resistances'][:2]: html += f"  • {r}\n\n"
-    
     html += f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
     html += signal_html
     return html
 
 def analyze_with_local_llm(context_dict):
-    # 先剥离出不需要喂给大模型的原始打分数据，减轻 JSON 负担
     clean_ctx = {k: v for k, v in context_dict.items() if k != "Raw_Data_For_Scoring"}
-    data_json = json.dumps(clean_ctx, indent=2, ensure_ascii=False)
-    
+    data_json = json.dumps(clean_ctx, default=str, ensure_ascii=False)
     signal_html = generate_trading_signal(context_dict)
+    
     client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
-    
     system_prompt = f"""
-    你是一个负责排版和语言润色的顶级量化金融播报员。
-    
-    【最高指令：绝对服从 Python】
-    所有的趋势定性、OBV筹码、盘口深度、ATR波动率等，均已在数据中为你算好。
-    用流畅、充满机构交易员专业语气的中文，将这些结论组合成清晰的报告。绝对照抄预设结论，禁止自行修改。
+    你是一个极其冷酷、只看数据的华尔街顶级对冲基金量化交易员。
+    读取数据后，先用极度专业、精炼的中文写一段 150 字以内的“宏观与微观盘面点评”。
     
     点评结束后，**必须原封不动、一字不差地**将以下这套系统给出的最终操作指令抄写在报告的最下方！
     系统指令文本如下：
     {signal_html}
     
-    【排版要求】
-    1. 必须遵守 Telegram HTML 限制，仅使用 <b> 加粗。
-    2. 列表项使用 "• "。直接换行。
-    3. 绝对不使用 Markdown 代码块 (```)。
-    
-    【内容结构】
-    <b>🕒 实时行情快照 (JST)</b>
-    • 最新报价与数据来源、时间。
-
-    <b>📊 行情主基调</b>
-    • 日线与周线结论。
-
-    <b>📈 动能、筹码与情绪</b>
-    • 必须包含：布林带位置、日周线RSI、量价与OBV状态、实时盘口深度 (Order Book)、ATR波动幅度、以及当前的宏观情绪 (贪婪指数与费率)。
-
-    <b>🎯 核心兵家必争之地</b>
-    • 提取离现价最近的前两项支撑和阻力。
-
-    <b>🔮 周期级趋势预测与演推</b>
-    • 结合上述盘口、OBV吸筹状态、波动率及均线，分别写出 1-3 天和 1-4 周的前瞻推演。
-    
-    (在此处插入系统指令文本)
+    【排版要求】只使用 <b> 加粗，使用 • 作为列表，严禁使用 ``` 任何代码块！
     """
     try:
         response = client.chat.completions.create(
             model="mistralai/ministral-3-14b-reasoning", 
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"这是核心量化数据：\n{data_json}\n请生成 HTML 纯净报告。"}
-            ],
-            temperature=0.1,
-            max_tokens=4096
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": f"当前数据：{data_json}"}],
+            temperature=0.1, max_tokens=4096
         )
-        
         content = response.choices[0].message.content.strip()
-        content = re.sub(r"^```[a-zA-Z]*\n?", "", content) 
-        content = re.sub(r"```$", "", content).strip()       
-        return content
-    except Exception as e:
-        return f"<b>❌ 连接失败</b>\n连接 LM Studio 失败。错误信息: {e}"
+        return re.sub(r"^```[a-zA-Z]*\n?", "", content).replace("```", "").strip()
+    except Exception as e: return f"<b>❌ 连接失败</b>\n{e}"
 
 # ================= Telegram 交互与主循环 =================
-
 def get_standard_keyboard():
-    # 增加独立的终极判决按钮
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 AI 深度分析", callback_data='run_llm'),
          InlineKeyboardButton("⚡ 极速快照", callback_data='run_fast')],
         [InlineKeyboardButton("🎯 终极判决 (信号)", callback_data='signal'),
          InlineKeyboardButton("📊 24h概况", callback_data='summary')],
         [InlineKeyboardButton("📈 资金费率", callback_data='funding'),
-         InlineKeyboardButton("🧭 恐慌贪婪指数", callback_data='fng')]
+         InlineKeyboardButton("🧭 恐贪指数", callback_data='fng')]
     ])
 
 async def generate_and_send_report(bot, chat_id, edit_message_id=None, use_llm=True, only_signal=False):
     try:
         loop = asyncio.get_event_loop()
-        market_data_dict = await loop.run_in_executor(None, get_market_data)
+        ctx = await loop.run_in_executor(None, get_market_data)
         
-        # 处理不同的指令请求
-        if only_signal:
-            report = f"🤖 <b>系统剥离行情，纯净执行信号：</b>\n\n{generate_trading_signal(market_data_dict)}"
-        elif use_llm:
-            report = await loop.run_in_executor(None, analyze_with_local_llm, market_data_dict)
-        else:
-            report = format_fast_snapshot(market_data_dict) 
+        if only_signal: report = f"🤖 <b>系统剥离行情，纯净执行信号：</b>\n\n{generate_trading_signal(ctx)}"
+        elif use_llm: report = await loop.run_in_executor(None, analyze_with_local_llm, ctx)
+        else: report = format_fast_snapshot(ctx) 
             
-        reply_markup = get_standard_keyboard()
+        markup = get_standard_keyboard()
+        if edit_message_id: await bot.edit_message_text(chat_id=chat_id, message_id=edit_message_id, text=report, parse_mode="HTML", reply_markup=markup)
+        else: await bot.send_message(chat_id=chat_id, text=report, parse_mode="HTML", reply_markup=markup)
+    except Exception as e: await bot.send_message(chat_id=chat_id, text=f"❌ 运行出错: {e}")
 
-        if edit_message_id:
-            await bot.edit_message_text(chat_id=chat_id, message_id=edit_message_id, text=report, parse_mode="HTML", reply_markup=reply_markup)
-        else:
-            await bot.send_message(chat_id=chat_id, text=report, parse_mode="HTML", reply_markup=reply_markup)
-    except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"❌ 运行出错: {e}")
-
-# --- 指令处理器 ---
-async def cmd_run_llm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_run_llm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
-    status_message = await update.message.reply_text("🔄 深度数据融合中，唤醒大模型...")
-    await generate_and_send_report(context.bot, ALLOWED_USER_ID, status_message.message_id, use_llm=True)
+    msg = await update.message.reply_text("🔄 深度数据融合中，唤醒大模型...")
+    await generate_and_send_report(context.bot, ALLOWED_USER_ID, msg.message_id, use_llm=True)
 
-async def cmd_run_fast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_run_fast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
     await generate_and_send_report(context.bot, ALLOWED_USER_ID, use_llm=False)
 
-async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
     await generate_and_send_report(context.bot, ALLOWED_USER_ID, only_signal=True)
 
-async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
     await update.message.reply_text(get_live_funding_rate(), parse_mode="HTML", reply_markup=get_standard_keyboard())
 
-async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
     await update.message.reply_text(get_24h_summary(), parse_mode="HTML", reply_markup=get_standard_keyboard())
 
-async def cmd_fng(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_fng(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
     await update.message.reply_text(get_fear_and_greed(), parse_mode="HTML", reply_markup=get_standard_keyboard())
 
-# --- 内联按钮回调 ---
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ALLOWED_USER_ID: return
     await query.answer()
@@ -516,17 +477,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif query.data == 'fng':
         await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=get_fear_and_greed(), parse_mode="HTML", reply_markup=get_standard_keyboard())
 
-# --- 定时监控与推送 ---
-async def daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=ALLOWED_USER_ID, text="🌅 <b>时区例行推演：定时全维简报生成中...</b>", parse_mode="HTML")
     await generate_and_send_report(context.bot, ALLOWED_USER_ID, use_llm=True)
 
-async def price_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def price_monitor(context: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, get_market_data)
         
-        # 提取指标状态
         bb = data["Explicit_Momentum_Labels"]["Bollinger_Position"]
         rsi = data["Explicit_Momentum_Labels"]["Daily_RSI"]
         ob_imb = data["Volatility_and_Sentiment"]["Order_Book_Imbalance"]
@@ -534,29 +493,22 @@ async def price_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         src = data["Price_Source"]
         dt = data["Data_Timestamp_JST"]
 
-        # 重新单独拉取一次精准盘口数据，提取具体挂单量用于展示
         import ccxt
         exchange = ccxt.binance({'timeout': 2000})
         orderbook = exchange.fetch_order_book('BTC/USDT', limit=50)
-        bids_vol = sum(bid[1] for bid in orderbook['bids']) # 累计买单
-        asks_vol = sum(ask[1] for ask in orderbook['asks']) # 累计卖单
+        bids_vol = sum(bid[1] for bid in orderbook['bids']) 
+        asks_vol = sum(ask[1] for ask in orderbook['asks']) 
         ratio = bids_vol / asks_vol if asks_vol > 0 else 1.0
 
         alert = ""
-        # 1. 空间异动判定
-        if "极度" in bb: 
-            alert += f"▪️ <b>空间异动：</b>价格 {bb}\n"
-        # 2. 动能异动判定
-        if "极度" in rsi: 
-            alert += f"▪️ <b>动能异动：</b>日线 RSI 处于 {rsi} 状态\n"
-        # 3. 盘口异动判定
+        if "极度" in bb: alert += f"▪️ <b>空间异动：</b>价格 {bb}\n"
+        if "极度" in rsi: alert += f"▪️ <b>动能异动：</b>日线 RSI 处于 {rsi} 状态\n"
         if "极强" in ob_imb or "沉重" in ob_imb: 
             alert += f"▪️ <b>盘口异动：</b>{ob_imb}\n"
             alert += f"  - 50档累计买单: <code>{bids_vol:.2f} BTC</code>\n"
             alert += f"  - 50档累计卖单: <code>{asks_vol:.2f} BTC</code>\n"
             alert += f"  - 实测买卖比例: <code>{ratio:.2f}</code>\n"
         
-        # 如果触发了任何一项异动，则组装满血版警报下发
         if alert:
             msg = (
                 f"🚨 <b>【量化盯盘警报】</b> 🚨\n\n"
@@ -566,16 +518,13 @@ async def price_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"• 抓取时间：{dt}\n\n"
                 f"<b>🔍 异动指标详情</b>\n"
                 f"{alert}\n"
-                f"<i>💡 建议点击下方 /signal 获取最新买卖判定。</i>"
+                f"<i>💡 建议点击下方 /signal 获取最新风控买卖判定。</i>"
             )
             await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode="HTML")
     except Exception as e:
         print(f"⚠️ 盯盘监控运行中遭遇偶发异常: {e}")
 
-# ================= 永续运行与网络守护 =================
-
 def wait_for_internet():
-    """持续检查网络，直到 ping 通公共 DNS"""
     print("🌐 等待网络连接...")
     while True:
         try:
@@ -583,24 +532,20 @@ def wait_for_internet():
             print("✅ 网络已就绪。")
             return
         except OSError:
-            time.sleep(30)
+            time.sleep(10)
 
 def main():
-    print("🤖 量化外挂：终极双轨判定引擎启动。")
+    print("🤖 量化外挂：终极双轨风控引擎（防插针与盈亏比熔断）已启动。")
     while True:
         try:
-            # 1. 确保网络就绪
             wait_for_internet()
-            
-            # 2. 初始化 App
             application = Application.builder().token(BOT_TOKEN).build()
 
-            # 注册命令
             async def setup_bot(app):
                 await app.bot.set_my_commands([
                     ("fast", "⚡ 极速快照 (含交易信号)"),
                     ("run", "🚀 AI 深度分析 (含交易信号)"),
-                    ("signal", "🎯 纯净交易指令 (入场/止损)"),
+                    ("signal", "🎯 纯净交易指令 (入场/风控)"),
                     ("funding", "📈 实时资金费率"),
                     ("summary", "📊 24小时盘面概况"),
                     ("fng", "🧭 恐慌贪婪指数")
@@ -609,13 +554,11 @@ def main():
             loop = asyncio.get_event_loop()
             loop.run_until_complete(setup_bot(application))
 
-            # 设置定时任务
             job_queue = application.job_queue
             job_queue.run_daily(daily_digest, time=dt_time(hour=8, minute=0, tzinfo=TOKYO_TZ), chat_id=ALLOWED_USER_ID)
             job_queue.run_daily(daily_digest, time=dt_time(hour=19, minute=0, tzinfo=TOKYO_TZ), chat_id=ALLOWED_USER_ID)
             job_queue.run_repeating(price_monitor, interval=900, first=10, chat_id=ALLOWED_USER_ID)
 
-            # 绑定处理器
             application.add_handler(CommandHandler("run", cmd_run_llm))
             application.add_handler(CommandHandler("fast", cmd_run_fast))
             application.add_handler(CommandHandler("signal", cmd_signal))
