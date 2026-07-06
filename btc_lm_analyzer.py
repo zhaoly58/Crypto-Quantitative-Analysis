@@ -131,8 +131,11 @@ def fetch_sentiment_data():
 def get_market_data():
     btc = yf.Ticker("BTC-USD")
     
+    # 1. 下载日线历史底座
     df_daily = btc.history(period="1y", interval="1d")
     df_daily.index = df_daily.index.tz_localize(None)
+    
+    # 计算基础日线技术指标
     df_daily['EMA_20'] = EMAIndicator(close=df_daily['Close'], window=20).ema_indicator()
     df_daily['EMA_50'] = EMAIndicator(close=df_daily['Close'], window=50).ema_indicator()
     df_daily['EMA_200'] = EMAIndicator(close=df_daily['Close'], window=200).ema_indicator()
@@ -142,15 +145,18 @@ def get_market_data():
     indicator_bb = BollingerBands(close=df_daily['Close'], window=20, window_dev=2)
     df_daily['BB_High'] = indicator_bb.bollinger_hband()
     df_daily['BB_Low'] = indicator_bb.bollinger_lband()
-    df_daily['Volume_MA20'] = SMAIndicator(close=df_daily['Volume'], window=20).sma_indicator()
     
+    # ⚔️ 核心修复点 1：将所有原先错误的 df_d 统一矫正为 df_daily 
+    df_daily['Volume_MA20'] = SMAIndicator(close=df_daily['Volume'], window=20).sma_indicator()
     df_daily['ATR'] = AverageTrueRange(high=df_daily['High'], low=df_daily['Low'], close=df_daily['Close'], window=14).average_true_range()
     
     df_daily['OBV'] = OnBalanceVolumeIndicator(close=df_daily['Close'], volume=df_daily['Volume']).on_balance_volume()
     df_daily['OBV_MA'] = SMAIndicator(close=df_daily['OBV'], window=20).sma_indicator()
     
+    # 清理由于计算均线产生的历史空行
     df_daily.dropna(inplace=True)
     
+    # 异常数据源检查
     pct_change = df_daily['Close'].pct_change().abs().iloc[-1]
     if pct_change > 0.50: raise Exception("检测到单日振幅>50%，Yahoo数据源可能遭遇插针污染，拒绝分析。")
     
@@ -162,7 +168,7 @@ def get_market_data():
     R1 = 2 * PP - prev_d['Low']
     S1 = 2 * PP - prev_d['High']
 
-    # 周线历史底座
+    # 2. 下载周线历史底座
     df_weekly = btc.history(period="5y", interval="1wk")
     df_weekly.index = df_weekly.index.tz_localize(None)
     df_weekly['EMA_20'] = EMAIndicator(close=df_weekly['Close'], window=20).ema_indicator()
@@ -172,7 +178,7 @@ def get_market_data():
     df_weekly.dropna(inplace=True)
     latest_w = df_weekly.iloc[-1]
 
-    # 实时盘口
+    # 3. 实时盘口深度抓取 (Binance)
     order_book_status = "数据获取失败"
     imbalance = 1.0
     try:
@@ -196,6 +202,7 @@ def get_market_data():
         data_time = pd.Timestamp.now(tz='Asia/Tokyo').strftime('%Y-%m-%d %H:%M:%S')
         price_source = "Yahoo (延迟)"
 
+    # 4. 获取外部清算与情绪数据
     sentiment = fetch_sentiment_data()
 
     all_levels = {
@@ -214,6 +221,7 @@ def get_market_data():
         try: funding_val = float(sentiment['funding'].split('%')[0])
         except: pass
 
+    # ⚔️ 核心修复点 2：将完整的、清洗后的全维度上下文打包在函数尾部统一 return，完美对接打分引擎
     context = {
         "Asset": "BTC-USDT",
         "Current_Price": current_price,
@@ -243,7 +251,10 @@ def get_market_data():
             "EMA20": latest_d['EMA_20'],
             "EMA50": latest_d['EMA_50'],
             "MACD": latest_d['MACD_Histogram'],
-            "OBV_Up": latest_d['OBV'] > latest_d['OBV_MA'],
+            "OBV_Up": bool(latest_d['OBV'] > latest_d['OBV_MA']),
+            "Volume": float(latest_d['Volume']),
+            "Prev_Volume": float(df_daily['Volume'].iloc[-2]),  # 👈 新增这一行：提取昨日完整成交量          
+            "Volume_MA20": float(latest_d['Volume_MA20']), 
             "ATR": latest_d['ATR'],
             "BB_H": latest_d['BB_High'],
             "BB_L": latest_d['BB_Low'],
@@ -257,13 +268,17 @@ def get_market_data():
     }
     return context
 
-# --- 🔥 全新升级：量化严苛风控打分引擎 🔥 ---
+# --- 🔥 全新升级：【门神过滤体】实盘量化执行大脑 (防时差与负风险版) ---
 def generate_trading_signal(ctx):
     price = ctx["Current_Price"]
     raw = ctx["Raw_Data_For_Scoring"]
     atr = raw["ATR"]
     
-    # 【因子打分引擎】
+    # 💡 【同步回测圣杯参数】
+    MAX_LOSS_PCT = 0.08  # 铁律：最大现货亏损 8%
+    RR_RATIO = 1.5       # 铁律：强行 1.5 倍盈亏比
+    
+    # 【实盘 6 因子打分引擎】
     score = 0
     if price > raw["EMA20"]: score += 1
     elif price < raw["EMA20"]: score -= 1
@@ -276,78 +291,73 @@ def generate_trading_signal(ctx):
     if raw["OrderBookRatio"] > 1.5: score += 1
     elif raw["OrderBookRatio"] < 0.66: score -= 1
     
-    # 逆向情绪加持
     if raw["FNG_Value"] < 30 and raw["Funding_Value"] < 0: score += 1
     elif raw["FNG_Value"] > 75 and raw["Funding_Value"] > 0.05: score -= 1
 
-    action, signal = "⏳ 观望 (Neutral)", "指标分歧，空仓等待方向。"
-    entry, sl, tp1, tp2, rr_ratio = 0, 0, 0, 0, 0
+    action, signal = "⏳ 观望 (Neutral)", "指标分歧或未满足门神过滤，空仓等待。"
+    entry, sl, tp, risk = 0, 0, 0, 0
     
+    # 💡 解决成交量时差陷阱：今日已放量 OR 昨日已放量，均视为有效突破
+    volume_confirmed = (raw["Volume"] > raw["Volume_MA20"]) or (raw["Prev_Volume"] > raw["Volume_MA20"])
+
     # ================= 多头风控逻辑 =================
-    if score >= 1: 
-        is_strong = (score >= 4)
-        action = "🚀 强力做多 (Strong Long)" if is_strong else "📈 逢低接多 (Buy the Dip)"
-        signal = "多因子共振，具备强冲高动能。" if is_strong else "大方向偏多，切勿追高，等回踩支撑进场。"
-        
-        # 1. 锚定建仓位
-        entry = price if is_strong else min(price, raw["EMA20"])
-        
-        # 2. 结构防插针止损位 (1.5 ATR 与 布林带下轨 的博弈)
-        sl_math = entry - (1.5 * atr)
-        sl = min(sl_math, raw["BB_L"] * 0.998) # 若数学止损悬在半空，强制下调至下轨下方 0.2%
-        risk = entry - sl
-        
-        # 3. 止盈倒挂纠正机制 (寻找前方有效阻力)
-        valid_resistances = [x for x in [raw["Pivot_R1"], raw["BB_H"], entry + 2*atr] if x > entry]
-        tp1 = min(valid_resistances) # 减仓第一目标：最近阻力
-        tp2 = max(valid_resistances) # 终极波段目标：最远阻力
-        
-        # 4. 盈亏比熔断器计算
-        rr_ratio = (tp1 - entry) / risk if risk > 0 else 0
-        
-        if rr_ratio < 1.5:
-            action = f"⏳ 放弃多单 (风控熔断)"
-            signal = f"方向虽偏多，但上方最近阻力 ({tp1:.0f}) 空间受限。预期盈亏比仅为 <b>{rr_ratio:.2f}</b> (<1.5)，且止损成本过高，强行建仓易受损，放弃。"
+    # 💡 解决分数漏洞：门槛从 >=1 提高到 >=3，强制要求多头高度共振
+    if score >= 3: 
+        if price > raw["EMA50"] and volume_confirmed:
+            action = "🚀 强力做多 (Strong Long)"
+            signal = "多头高度共振且放量确认，站稳生命线，准许做多。"
+            entry = price
+            
+            sl_math = entry - (1.5 * atr)
+            sl_hard = entry * (1 - MAX_LOSS_PCT)
+            sl = max(sl_math, sl_hard, raw["BB_L"] * 0.998)
+            
+            risk = entry - sl
+            # 💡 解决负风险倒挂漏洞：确保算出来的止损位符合逻辑
+            if risk > 0:
+                tp = entry + (RR_RATIO * risk)
+            else:
+                action = "⏳ 放弃多单 (风控计算异常)"
+                signal = f"底层偏多，但防插针止损位 ({sl:.0f}) 高于现价，盈亏比计算失效，放弃。"
+        else:
+            action = "⏳ 放弃多单 (门神拦截)"
+            signal = f"底层强势 ({score}/6)，但未满足【价格&gt;EMA50】或【放量】的门神条件，防止假突破，放弃。"
 
     # ================= 空头风控逻辑 =================
-    elif score <= -1:
-        is_strong = (score <= -4)
-        action = "🩸 强力做空 (Strong Short)" if is_strong else "📉 逢高做空 (Sell the Rip)"
-        signal = "空头共振，顺势直接下空。" if is_strong else "大方向偏空，反弹动能极弱，依托阻力空。"
-        
-        entry = price if is_strong else max(price, raw["EMA20"])
-        
-        # 结构防插针止损 (1.5 ATR 与 布林带上轨 博弈)
-        sl_math = entry + (1.5 * atr)
-        sl = max(sl_math, raw["BB_H"] * 1.002) # 强制上调至布林带上轨上方 0.2%
-        risk = sl - entry
-        
-        # 止盈倒挂纠正机制 (寻找下方有效支撑)
-        valid_supports = [x for x in [raw["Pivot_S1"], raw["BB_L"], entry - 2*atr] if x < entry]
-        tp1 = max(valid_supports) # 减仓第一目标：最高价(最近支撑)
-        tp2 = min(valid_supports) # 终极波段目标：最低价(最深支撑)
-        
-        # 盈亏比熔断器计算
-        rr_ratio = (entry - tp1) / risk if risk > 0 else 0
-        
-        if rr_ratio < 1.5:
-            action = f"⏳ 放弃空单 (风控熔断)"
-            signal = f"方向虽偏空，但下方最近支撑 ({tp1:.0f}) 过近。预期盈亏比仅为 <b>{rr_ratio:.2f}</b> (<1.5)，反抽扫损风险极大，放弃。"
+    elif score <= -3:
+        if price < raw["EMA50"] and volume_confirmed:
+            action = "🩸 强力做空 (Strong Short)"
+            signal = "空头高度共振且放量确认，跌破生命线，准许做空。"
+            entry = price
+            
+            sl_math = entry + (1.5 * atr)
+            sl_hard = entry * (1 + MAX_LOSS_PCT)
+            sl = min(sl_math, sl_hard, raw["BB_H"] * 1.002)
+            
+            risk = sl - entry
+            if risk > 0:
+                tp = entry - (RR_RATIO * risk)
+            else:
+                action = "⏳ 放弃空单 (风控计算异常)"
+                signal = f"底层偏空，但防插针止损位 ({sl:.0f}) 低于现价，盈亏比计算失效，放弃。"
+        else:
+            action = "⏳ 放弃空单 (门神拦截)"
+            signal = f"底层弱势 ({score}/6)，但未满足【价格&lt;EMA50】或【放量】的门神条件，谨防反抽，放弃。"
 
     # ================= 输出排版 =================
     html = f"<b>🎯 终极量化判决 (多空倾向: {score}/6)</b>\n"
     html += f"• <b>执行动作：</b> {action}\n"
     html += f"• <b>逻辑归因：</b> {signal}\n\n"
     
-    if "放弃" not in action and "观望" not in action:
-        html += f"<b>⚔️ 严苛风控操盘计划 (ATR 倒推)</b>\n"
-        html += f"• <b>预期建仓：</b> <code>{entry:.2f}</code> 附近\n"
-        html += f"• <b>🚩 结构止损：</b> <code>{sl:.2f}</code> (防插针保护)\n"
-        html += f"• <b>💰 第一减仓：</b> <code>{tp1:.2f}</code> (盈亏比 {rr_ratio:.2f})\n"
-        html += f"• <b>💎 极限目标：</b> <code>{tp2:.2f}</code> (阻力/支撑区间)\n"
+    if "强力" in action:
+        html += f"<b>⚔️ 【门神过滤体】风控操盘计划</b>\n"
+        html += f"• <b>现价建仓：</b> <code>{entry:.2f}</code> 附近\n"
+        html += f"• <b>🚩 铁律止损：</b> <code>{sl:.2f}</code> (防插针/8%兜底)\n"
+        html += f"• <b>💎 机械止盈：</b> <code>{tp:.2f}</code> (强吃 1.5倍 盈亏比)\n"
+        html += f"<i>(注：实盘请死守止损，切勿受诱惑提前移动保本)</i>"
     elif "放弃" in action:
         html += f"<b>🛡️ 拒绝理由 (管住手是交易的一部分)</b>\n"
-        html += f"• 系统测算本次交易胜率与盈亏比不匹配。强制阻止开仓操作。\n"
+        html += f"• 触发风控拦截：未满足回测验证的高胜率环境，强制阻止开仓。\n"
         
     return html
 
@@ -424,14 +434,28 @@ async def generate_and_send_report(bot, chat_id, edit_message_id=None, use_llm=T
         loop = asyncio.get_event_loop()
         ctx = await loop.run_in_executor(None, get_market_data)
         
-        if only_signal: report = f"🤖 <b>系统剥离行情，纯净执行信号：</b>\n\n{generate_trading_signal(ctx)}"
-        elif use_llm: report = await loop.run_in_executor(None, analyze_with_local_llm, ctx)
-        else: report = format_fast_snapshot(ctx) 
+        # 处理不同的指令请求
+        if only_signal:
+            report = f"🤖 <b>系统剥离行情，纯净执行信号：</b>\n\n{generate_trading_signal(ctx)}"
+        elif use_llm:
+            report = await loop.run_in_executor(None, analyze_with_local_llm, ctx)
+        else:
+            report = format_fast_snapshot(ctx) 
             
-        markup = get_standard_keyboard()
-        if edit_message_id: await bot.edit_message_text(chat_id=chat_id, message_id=edit_message_id, text=report, parse_mode="HTML", reply_markup=markup)
-        else: await bot.send_message(chat_id=chat_id, text=report, parse_mode="HTML", reply_markup=markup)
-    except Exception as e: await bot.send_message(chat_id=chat_id, text=f"❌ 运行出错: {e}")
+        # ================= 🛡️ 终极 HTML 防火墙 =================
+        # 匹配所有孤立的、没有正确闭合的 < 符号（即后面没有紧跟 html 标签如 b, /b, code, /code, a, /a, u, /u, i, /i 等）
+        # 将它们强行物理洗白为 &lt; 防止大模型胡乱吐出数学符号导致 Telegram 崩溃
+        report = re.sub(r'<(?!/?(b|code|a|u|i|pre)\b)', '&lt;', report)
+        # =======================================================
+            
+        reply_markup = get_standard_keyboard()
+
+        if edit_message_id:
+            await bot.edit_message_text(chat_id=chat_id, message_id=edit_message_id, text=report, parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=report, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        await bot.send_message(chat_id=chat_id, text=f"❌ 运行出错: {e}")
 
 async def cmd_run_llm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
